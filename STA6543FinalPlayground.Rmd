@@ -1,0 +1,559 @@
+---
+title: "Final Project - Direct-Mail Fundraising Modelling Prediction"
+author: "Xiaoqi Jiang"
+date: "2025-07-25"
+output:
+  html_notebook:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(caret) 
+library(randomForest) 
+library(car) 
+library(corrplot)  
+library(pROC) 
+```
+
+## Introduction
+This report analyzes a dataset from a national veterans’ organization to develop a predictive model for their direct-mail fundraising campaign. The goal is to maximize expected net profit by identifying donors, given a 5.1% response rate, $13.00 average donation, and $0.68 mailing cost per person. The dataset `fundraising.csv` contains 3,000 records with 22 variables, balanced to have equal donors and non-donors. I partition the data, perform exploratory data analysis (EDA), build and evaluate two classification models (logistic regression and random forest), and predict donors in `future_fundraising.csv` for leaderboard submission.
+
+### Business Objectives and Goals
+The primary business objective is to maximize the expected net profit of a direct-mail fundraising campaign for a national veterans’ organization. The campaign incurs a cost of $0.68 per mailing and yields an average donation of $13.00 from responders, with a historical response rate of 5.1%. The goal is to develop a predictive model that identifies potential donors to optimize mailing efforts, ensuring a positive return on investment. Specific objectives include:  
+
+- Maximizing Net Profit: Select individuals for mailing where the expected donation exceeds the mailing cost, calculated as \( \text{Expected Net Profit} = (\text{True Positives} \times \$12.32) - (\text{False Positives} \times \$0.68) \).
+- Improving Predictive Accuracy: Achieve a classification accuracy above 50% (random guessing on the balanced dataset) to ensure reliable donor identification.  
+- Scalability for Future Campaigns: Create a reproducible modeling pipeline that can be applied to future datasets, ensuring consistency and auditability.  
+
+This approach aligns with the organization’s need to allocate resources efficiently, targeting only high-probability donors to avoid the net loss of blanket mailings \(0.051 \times \$13.00 - \$0.68 = -\$0.017\) per mailing.  
+
+### Data Sources and Data Used
+The dataset is sourced from a national veterans’ organization and consists of two files:  
+
+- `fundraising.csv`: Contains 3,000 records with 22 variables, including demographic information (e.g., `num_child`, `income`, `female`, `homeowner`), wealth indicators (e.g., `wealth`, `home_value`, `med_fam_inc`), and past donation behavior (e.g., `lifetime_gifts`, `num_prom`, `avg_gift`). The dataset is balanced, with approximately 50% donors and 50% non-donors, achieved through weighted sampling to address the original population’s 5.1% response rate.  
+- `future_fundraising.csv`: A test dataset for generating predictions, assumed to reflect the original 5.1% response rate, with the same variables but no target variable.  
+
+Reasoning for Weighted Sampling: Weighted sampling was used to create a balanced training set (50% donors, 50% non-donors) instead of a simple random sample, which would reflect the original 5.1% response rate (approximately 153 donors out of 3,000). A simple random sample would result in a severe class imbalance, causing models to overpredict the majority class (non-donors) and fail to identify donors effectively. Weighted sampling ensures that models learn patterns from both classes equally, improving sensitivity to donors and enabling better profit optimization. The validation set retains this balance to estimate out-of-sample performance, while the test set predictions are adjusted to account for the original population imbalance.  
+
+## Partitioning
+The dataset was partitioned into an 80% training set and a 20% validation set to estimate out-of-sample error, using a random seed of 12345 for reproducibility. The target variable was converted to a factor with levels “No Donor” and “Donor” (renamed to No.Donor and Donor for compatibility with modeling packages).
+```{r}
+# Load dataset
+fundraising <- read.csv("fundraising.csv")
+
+# Convert target to factor
+fundraising$target <- factor(fundraising$target, levels = c("No Donor", "Donor"))
+levels(fundraising$target) <- make.names(levels(fundraising$target))
+
+# Set seed
+set.seed(12345)
+
+# Create 80/20 split
+trainIndex <- createDataPartition(fundraising$target, p = 0.8, list = FALSE)
+train_data <- fundraising[trainIndex, ]
+valid_data <- fundraising[-trainIndex, ]
+```
+
+## Model Building
+### Exploratory Data Analysis
+Next, the predictors of the dataset were examed and evaluated for their association with the response variable. This way it can be decided which might be good candidate predictors and decide if there are any collinear with each other. 
+
+#### Type of Analysis Performed
+Exploratory Data Analysis (EDA) was conducted to identify predictors associated with donor status and assess multicollinearity. The analysis included:  
+
+- Descriptive Statistics: Summarized the distribution of all 22 variables to understand their range, central tendency, and variability.  
+- Visualization: Box plots and bar plots compared predictor distributions between donors and non-donors (e.g., `num_child`, `income`, `months_since_donate`, `homeowner`, `female`).  
+- Statistical Tests: Chi-square tests evaluated the association of categorical variables with the target.  
+- Correlation Analysis: A correlation matrix and heatmap identified multicollinearity among numerical predictors.  
+- VIF Analysis: Variance Inflation Factor (VIF) analysis quantified multicollinearity in a logistic regression model to guide variable selection.  
+
+```{r}
+# Initial exploration
+head(fundraising)
+str(fundraising)
+summary(fundraising)
+```
+From the table shown above, it is obvious that the `fundraising.csv` dataset contains 3,000 records, each representing a potential donor. The dataset includes 22 variables, covering demographic information, wealth indicators, and past donation behavior. Now I need to convert other Categorical Variables to factors. Before analysis, several key variables were converted to factor (categorical) type to ensure proper handling by statistical models. These include `homeowner`, `female`, and the zip code indicator variables (`zipconvert2`, `zipconvert3`, `zipconvert4`, `zipconvert5`). This is crucial for models to interpret these variables as distinct categories rather than numerical values.  
+
+```{r}
+fundraising$homeowner <- as.factor(fundraising$homeowner)
+fundraising$female <- as.factor(fundraising$female)
+fundraising$zipconvert2 <- as.factor(fundraising$zipconvert2)
+fundraising$zipconvert3 <- as.factor(fundraising$zipconvert3)
+fundraising$zipconvert4 <- as.factor(fundraising$zipconvert4)
+fundraising$zipconvert5 <- as.factor(fundraising$zipconvert5)
+
+table(fundraising$target)
+prop.table(table(fundraising$target))
+
+# Update train and valid sets after factor conversion
+train_data <- fundraising[trainIndex, ]
+valid_data <- fundraising[-trainIndex, ]
+```
+The `target` variable, indicating whether an individual is a 'Donor' or 'No Donor', is approximately balanced in this training dataset due to weighted sampling, with roughly 50% donors and 50% non-donors. This weighted sampling was employed to address the severe class imbalance in the original population (where only 5.1% are responders). I am now going to use plots to explore how predictors differ between Donors and Non-Donors.  
+
+```{r}
+# Initial Plots
+library(ggplot2)
+ggplot(fundraising, aes(x = target, y = wealth)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = "Wealth by Donor Status", x = "Donor Status", y = "Wealth")
+
+ggplot(fundraising, aes(x = homeowner, fill = target)) +
+  geom_bar(position = "fill") +
+  labs(title = "Donor Status by Homeownership", x = "Homeowner", y = "Proportion")
+
+ggplot(fundraising, aes(x = home_value, y = log1p(lifetime_gifts))) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "loess", se = FALSE, color = "darkgreen") +
+  labs(title = "Home Value vs Log(Lifetime Gifts)", x = "Home Value", y = "Log(Lifetime Gifts + 1)")
+
+ggplot(fundraising, aes(x = target, y = log1p(lifetime_gifts))) +
+  geom_boxplot() +
+  labs(title = "Log(Lifetime Gifts) by Donor Status", y = "Log(Lifetime Gifts + 1)")
+
+ggplot(fundraising, aes(x = female, fill = target)) +
+  geom_bar(position = "fill") +
+  labs(title = "Proportion of Donors by Gender", y = "Proportion")
+
+# Additional Plots for Further Explorations
+# 1. Income vs Donor Status (Box Plot)
+ggplot(fundraising, aes(x = target, y = income)) +
+  geom_boxplot(fill = "lightcoral") +
+  labs(title = "Income by Donor Status", x = "Donor Status", y = "Household Income")
+
+# 2. Number of Children vs Donor Status (Box Plot - if numerical, or Bar for proportions if few categories)
+ggplot(fundraising, aes(x = target, y = num_child)) +
+  geom_boxplot(fill = "lightgreen") +
+  labs(title = "Number of Children by Donor Status", x = "Donor Status", y = "Number of Children")
+
+# 3. Num Promotions vs Donor Status (Box Plot)
+ggplot(fundraising, aes(x = target, y = num_prom)) +
+  geom_boxplot(fill = "gold") +
+  labs(title = "Number of Promotions by Donor Status", x = "Donor Status", y = "Lifetime Number of Promotions")
+
+# 4. Largest Gift vs Donor Status (Box Plot)
+ggplot(fundraising, aes(x = target, y = log1p(largest_gift))) +
+  geom_boxplot(fill = "salmon") +
+  labs(title = "Log(Largest Gift + 1) by Donor Status", x = "Donor Status", y = "Log(Largest Gift + 1)")
+
+# 5. Last Gift vs Donor Status (Box Plot)
+ggplot(fundraising, aes(x = target, y = log1p(last_gift))) +
+  geom_boxplot(fill = "purple") +
+  labs(title = "Log(Last Gift + 1) by Donor Status", x = "Donor Status", y = "Log(Last Gift + 1)")
+
+# 6. Months Since Donate vs Donor Status (Box Plot)
+ggplot(fundraising, aes(x = target, y = months_since_donate)) +
+  geom_boxplot(fill = "grey") +
+  labs(title = "Months Since Last Donation by Donor Status", x = "Donor Status", y = "Months Since Last Donation")
+
+# 7. Time Lag vs Donor Status (Box Plot)
+ggplot(fundraising, aes(x = as.factor(target), y = log1p(time_lag))) +
+  geom_boxplot(fill = "brown") +
+  labs(title = "Log(Time Lag (1st to 2nd Gift)) by Donor Status", x = "Donor Status", y = "Log(Time Lag + 1)")
+
+# 8. Avg Gift vs Donor Status (Box Plot)
+ggplot(fundraising, aes(x = as.factor(target), y = log1p(avg_gift))) +
+  geom_boxplot(fill = "darkblue") +
+  labs(title = "Log(Average Gift + 1) by Donor Status", x = "Donor Status", y = "Log(Average Gift + 1)")
+
+# 9. Median/Average Family Income (med_fam_inc, avg_fam_inc) vs Donor Status (Box Plot)
+ggplot(fundraising, aes(x = as.factor(target), y = log1p(med_fam_inc))) +
+  geom_boxplot(fill = "cyan") +
+  labs(title = "Log(Median Family Income by Donor Status)", x = "Donor Status", y = "Log(Median Family Income + 1)")
+
+ggplot(fundraising, aes(x = as.factor(target), y = log1p(avg_fam_inc))) +
+  geom_boxplot(fill = "darkcyan") +
+  labs(title = "Log(Average Family Income by Donor Status)", x = "Donor Status", y = "Log(Average Family Income + 1)")
+
+# 10. Pct < 15k vs Donor Status (Box Plot)
+ggplot(fundraising, aes(x = as.factor(target), y = log1p(pct_lt15k))) +
+  geom_boxplot(fill = "darkorange") +
+  labs(title = "Log(Percent Earning < $15k by Donor Status)", x = "Donor Status", y = "Log(Percent Earning < $15k + 1)")
+```
+Findings:  
+Visualizations like box plots (e.g., `num_child` vs. `target`, `income` vs. `target`, `months_since_donate` vs. `target`) provide insights into how the distribution of these numerical variables differs between donors and non-donors. For example, individuals with fewer children or those with higher incomes show different donation patterns.
+
+- Descriptive Statistics: The dataset includes numerical variables (e.g., `income`, `home_value`, `lifetime_gifts`) and categorical variables (e.g., `homeowner`, `female`, `zipconvert2-5`). No missing values were found.  
+- Visualizations: Box plots showed that donors tend to have higher `income`, lower `num_child`, and shorter `months_since_donate` compared to non-donors. Bar plots indicated weak associations for `homeowner` and `female`.  
+- Chi-Square Tests: Categorical variables like `zipconvert2`, `zipconvert3`, and `female` had p-values > 0.05, suggesting weak marginal associations, but were retained for potential interactions in complex models.  
+- Correlation and VIF: Strong correlations were observed `among med_fam_inc`, `avg_fam_inc`, `home_value`, `wealth`, and `among lifetime_gifts`, `largest_gift`, `last_gift`, `avg_gift`. VIF analysis confirmed low multicollinearity after excluding redundant variables.  
+
+
+
+```{r}
+# Chi-square test results for categorical variables
+fundraising$target <- as.factor(fundraising$target)
+
+# Get all categorical variables except 'target'
+cat_vars <- names(fundraising)[sapply(fundraising, function(x) is.factor(x) || is.character(x))]
+cat_vars <- setdiff(cat_vars, "target")
+
+# Run chi-square test for each variable and store results
+chi_results <- data.frame(Variable = character(), P_Value = numeric(), stringsAsFactors = FALSE)
+
+for (var in cat_vars) {
+  tbl <- table(fundraising$target, fundraising[[var]])
+  test <- chisq.test(tbl)
+  chi_results <- rbind(chi_results, data.frame(Variable = var, P_Value = test$p.value))
+}
+
+# Sort results by p-value
+chi_results <- chi_results[order(chi_results$P_Value), ]
+print(chi_results)
+```
+As part of the exploratory data analysis, chi-square tests were conducted on all categorical predictors to assess their individual association with the binary target variable. Variables such as `zipconvert2`, `zipconvert3`, and `female` did not show statistically significant associations (p > 0.05). However, since chi-square tests assess only marginal relationships and do not consider interactions or combined predictive value, I retained these variables for further analysis in the logistic regression model. Additional diagnostics such as VIF and model performance metrics were used to make final decisions on variable selection.
+
+### Check for Multicollinearity
+To identify the most important predictors for donor status, I fitted a logistic regression model using all candidate variables. I examined the statistical significance of each predictor based on their p-values. Variables such as the number of children (`num_child`), household income (`income`), and months since the last donation (`months_since_donate`) showed strong and statistically significant associations with donor status (p < 0.05). The wealth variable had a marginally significant effect (p ≈ 0.09) and was considered for inclusion. Other predictors, including homeownership, gender, and various gift metrics, did not demonstrate significant contributions in this model and were candidates for removal to simplify the model. Consequently, a reduced logistic regression model was specified using only the significant and marginally significant predictors, which improves model interpretability while retaining predictive power.  
+```{r}
+# Select numeric predictors only
+numeric_vars <- fundraising %>%
+  select_if(is.numeric)
+
+# Correlation matrix
+cor_matrix <- cor(numeric_vars, use = "complete.obs")
+
+# Visualize
+corrplot(cor_matrix, method = "color", type = "upper", tl.cex = 0.7)
+```
+The heatmap is a visual shortcut to detect multicollinearity by showing which predictor variables are strongly correlated with each other. This visual evidence then guides the next steps, such as performing VIF analysis to quantify the multicollinearity and decide which variables to keep, transform, or remove from the linear models to improve their stability and interpretability. Upon reviewing the heatmap, several strong positive correlations immediately became apparent:  
+
+- Income and Wealth-Related Variables: I observed very strong positive correlations `among med_fam_inc`, `avg_fam_inc`, `home_value`, and `wealth`. This indicates that these variables capture very similar aspects of a potential donor's financial standing or the affluence of their neighborhood. To mitigate multicollinearity, I decided to remove `avg_fam_inc` as it was highly redundant with `med_fam_inc` and others.  
+
+- Past Giving History Variables: The heatmap also showed extremely strong positive correlations among `lifetime_gifts`, `largest_gift`, `last_gift`, and `avg_gift`. These variables all represent different facets of an individual's past donation behavior, leading to significant redundancy.  
+
+Based purely on the visual evidence of high multicollinearity from the heatmap, my strategy was to retain the most representative variable from each highly correlated group while removing the others. Therefore, I decided to remove (in addition to the zip codes):  
+
+- `avg_fam_inc`: Due to its very strong positive correlation with med_fam_inc and other financial indicators.  
+
+- `lifetime_gifts`: Because of its high correlation with other past giving metrics.  
+
+- `largest_gift`: For the same reason as lifetime_gifts, being highly correlated with other past giving metrics.  
+
+- `last_gift`: Also due to its strong correlation with other variables describing prior donations.  
+
+```{r}
+# Fit a basic logistic model
+model_vif <- glm(target ~ . - zipconvert2 - zipconvert3 - zipconvert4 - zipconvert5 - avg_fam_inc - lifetime_gifts - largest_gift - last_gift, 
+             data = train_data, 
+             family = "binomial")
+vif(model_vif)
+summary(model_vif)
+```
+The VIF analysis of this refined model revealed encouraging results. All remaining predictors exhibited VIF values well below 5, with most even below 2. This indicates that the previous removals successfully addressed significant multicollinearity, and the remaining variables are now largely independent of each other in a linear sense. For instance, `num_child` showed a VIF of 1.02, `income` had a VIF of 1.29, and `months_since_donate` had a VIF of 1.10. Even `med_fam_inc`, which was initially part of a highly collinear group, now displayed a VIF of 3.58, indicating acceptable levels of multicollinearity after the removal of avg_fam_inc. This low VIF profile ensures that the coefficient estimates for these predictors in a logistic regression model will be more stable and interpretable.  
+
+### Select Classification Tool and Parameters
+With multicollinearity adequately addressed, my focus shifted to selecting the most impactful predictors for the final model fitting. I considered both the low VIF scores and the statistical significance (p-values) from the summary of my logistic regression model.  
+
+Based on this comprehensive assessment, several variables stand out as strong candidates for inclusion in the final models. `num_child`, `income`, and `months_since_donate` emerged as particularly strong predictors due to their low VIFs and statistically significant p-values, indicating a clear and reliable relationship with the target variable. Additionally, `wealth` and `num_prom`, while showing borderline statistical significance, possess low VIFs and offer unique insights into donor characteristics and engagement. `avg_gift`, now serving as the sole representative of past giving history, also has a very low VIF, and while not individually significant in the preliminary model, it's crucial to retain this aspect of donor behavior for potential predictive power, especially in more complex models like Random Forest.  
+
+For the subsequent model building phase, I will proceed with these carefully selected predictors. For the Logistic Regression model, I will likely refine the set further using stepwise selection based on information criteria such as AIC, allowing the model to determine the optimal subset from this pool. For the Random Forest model, given its robustness to irrelevant features, I will initially include all identified low-VIF predictors, allowing its internal mechanisms to ascertain their ultimate importance.  
+
+```{r}
+# Select predictors (extended to include more features)
+final_predictors <- c("num_child", "income", "wealth", "home_value", "num_prom",
+                      "months_since_donate", "avg_gift", "lifetime_gifts", "largest_gift", "last_gift")
+train_data_final <- train_data %>% dplyr::select(all_of(final_predictors), target)
+valid_data_final <- valid_data %>% dplyr::select(all_of(final_predictors), target)
+
+# Scale numerical features
+preProc <- preProcess(train_data_final[, -which(names(train_data_final) == "target")], method = c("center", "scale"))
+train_data_scaled <- predict(preProc, train_data_final)
+valid_data_scaled <- predict(preProc, valid_data_final)
+
+# Define cross-validation settings
+trControl <- trainControl(method = "cv",
+                          number = 5,
+                          classProbs = TRUE,
+                          summaryFunction = profitSummary,
+                          allowParallel = TRUE)
+```
+
+### Model Training 
+#### Business Inputs
+The modeling process relied on the following inputs:  
+
+- Data: The `fundraising.csv dataset` (3,000 records) and `future_fundraising.csv` for predictions.  
+- Financial Parameters: Mailing cost ($0.68), average donation ($13.00), and population response rate (5.1%), used to define the profit metric.  
+- Computational Resources: R with packages `caret`, `randomForest`, `xgboost`, `e1071`, `gbm`, `pROC`, `dplyr`, `tidyr`, `ggplot2`, `car`, and `corrplot` for data processing, modeling, and visualization.  
+
+Methodology Used, Background, Benefits: A supervised classification approach was employed, using five algorithms:  
+
+- Logistic Regression: A linear model suitable for binary classification, interpretable, and sensitive to multicollinearity.  
+- Random Forest: An ensemble tree-based model robust to noise and irrelevant features, capturing non-linear relationships.  
+- XGBoost: A gradient boosting algorithm optimized for performance, handling complex interactions.  
+- SVM (Radial Kernel): A kernel-based method effective for non-linear boundaries.  
+- GBM: Another boosting method, balancing bias and variance for improved prediction.  
+
+Background: These methods were chosen for their complementary strengths. Logistic regression provides a baseline, while tree-based (random forest, XGBoost, GBM) and kernel-based (SVM) models capture non-linear patterns. The `caret` package facilitated consistent training with 5-fold cross-validation, optimizing a custom profit metric to align with the business objective.  
+
+Benefits:  
+
+- Profit Optimization: The custom metric \( \text{Profit} = (\text{TP} \times \$12.32) - (\text{FP} \times \$0.68) \) directly targets the business goal.  
+- Robustness: Multiple models reduce the risk of overfitting and improve generalizability.  
+- Reproducibility: The use of a fixed seed (12345) and documented preprocessing ensures consistent results.  
+
+The selected predictors (`num_child`, `income`, `wealth`, `home_value`, `num_prom`, `months_since_donate`, `avg_gift`, `lifetime_gifts`, `largest_gift`, `last_gift`) were used to train models. Numerical features were scaled, and 5-fold cross-validation optimized the custom profit metric.  
+```{r}
+# Define constants
+COST_PER_MAILING <- 0.68
+AVERAGE_DONATION <- 13.00
+NET_PROFIT_PER_DONOR <- AVERAGE_DONATION - COST_PER_MAILING
+
+# Custom profit calculation function
+calculate_profit <- function(probs, actual, threshold) {
+  predicted_char <- ifelse(probs > threshold, "Donor", "No.Donor")
+  actual_char <- as.character(actual)
+  TP <- sum(predicted_char == "Donor" & actual_char == "Donor")
+  FP <- sum(predicted_char == "Donor" & actual_char == "No.Donor")
+  profit <- (TP * NET_PROFIT_PER_DONOR) - (FP * COST_PER_MAILING)
+  return(profit)
+}
+
+# Custom profit metric for caret
+profitSummary <- function(data, lev = NULL, model = NULL) {
+  probs <- data$Donor
+  actual <- data$obs
+  threshold <- 0.5
+  predicted <- ifelse(probs > threshold, "Donor", "No.Donor")
+  TP <- sum(predicted == "Donor" & actual == "Donor")
+  FP <- sum(predicted == "Donor" & actual == "No.Donor")
+  profit <- (TP * NET_PROFIT_PER_DONOR) - (FP * COST_PER_MAILING)
+  c(Profit = profit)
+}
+
+# Define cross-validation settings
+trControl <- trainControl(method = "cv",
+                          number = 5,
+                          classProbs = TRUE,
+                          summaryFunction = profitSummary,
+                          allowParallel = TRUE)
+
+# Train models individually
+set.seed(12345)
+models <- list()
+
+# Logistic Regression
+cat("Training logistic...\n")
+models$logistic <- train(target ~ ., 
+                        data = train_data_scaled, 
+                        method = "glmnet", 
+                        metric = "Profit", 
+                        trControl = trControl,
+                        tuneGrid = expand.grid(alpha = c(0, 0.5, 1),   
+                                               lambda = c(0.001, 0.01, 0.1, 1)))
+print(models$logistic)
+print(models$logistic$bestTune)
+print(varImp(models$logistic))
+
+# Random Forest
+cat("Training rf...\n")
+models$rf <- train(target ~ ., 
+                   data = train_data_scaled, 
+                   method = "ranger",   
+                   metric = "Profit", 
+                   trControl = trControl,
+                   tuneGrid = expand.grid(mtry = c(2, 4, 6, 8),
+                                          min.node.size = c(1, 5, 10),
+                                          splitrule = c("gini", "extratrees")),
+                   num.trees = 1000,   
+                   importance = "impurity")
+print(models$rf)
+print(models$rf$bestTune)
+print(varImp(models$rf))
+
+# XGBoost
+cat("Training xgb...\n")
+models$xgb <- train(target ~ ., 
+                    data = train_data_scaled, 
+                    method = "xgbTree", 
+                    metric = "Profit", 
+                    trControl = trControl, 
+                    tuneGrid = expand.grid(nrounds = c(100, 200, 500, 1000),
+                                           max_depth = c(2, 3, 5, 7),
+                                           eta = c(0.001, 0.01, 0.05, 0.1),
+                                           gamma = c(0, 0.1, 0.5),
+                                           colsample_bytree = c(0.6, 0.8, 1),
+                                           min_child_weight = 1,
+                                           subsample = 0.8))
+print(models$xgb)
+print(models$xgb$bestTune)
+print(varImp(models$xgb))
+
+# SVM
+cat("Training svm...\n")
+models$svm <- train(target ~ ., 
+                    data = train_data_scaled, 
+                    method = "svmRadial", 
+                    metric = "Profit", 
+                    trControl = trainControl(method = "cv", number = 5, classProbs = TRUE, 
+                                             summaryFunction = profitSummary, allowParallel = TRUE,
+                                             search = "random"),
+                    tuneLength = 10)
+print(models$svm)
+print(models$svm$bestTune)
+print(varImp(models$svm))
+
+# GBM
+cat("Training gbm...\n")
+library(doParallel)
+registerDoParallel(cores = parallel::detectCores() - 1)
+models$gbm <- train(target ~ ., 
+                    data = train_data_scaled, 
+                    method = "gbm", 
+                    metric = "Profit", 
+                    trControl = trainControl(method = "cv", number = 5, classProbs = TRUE, 
+                                             summaryFunction = profitSummary, allowParallel = TRUE,
+                                             search = "random"),
+                    tuneLength = 20, 
+                    verbose = FALSE)
+print(models$gbm)
+print(models$gbm$bestTune)
+print(varImp(models$gbm))
+```
+
+### Classification Under Asymmetric Response and Cost
+In direct marketing campaigns, the ultimate goal is not merely to accurately classify individuals as donors or non-donors, but to maximize the net profit from the mailing effort. This necessitates a classification approach that accounts for the asymmetric costs and benefits associated with different prediction outcomes. The organization's current campaign parameters are critical to this calculation: each mailing costs \$0.68 to produce and send. From those who respond, the average donation is \$13.00\. Considering the overall response rate is 5.1%, a simple blanket mailing to everyone in the database would, on average, result in a net loss per mailing \( (0.051 \times \$13.00) - \$0.68 = \$0.663 - \$0.68 = -\$0.017 \). This highlights the necessity of a predictive model to selectively target potential donors. My objective is to maximize the expected net profit, which can be expressed as:  
+
+\( \text{Expected Net Profit} = (\text{True Positives} \times (\text{Average Donation} - \text{Cost per Mailing})) - (\text{False Positives} \times \text{Cost per Mailing}) \)
+
+Since each mailing costs $0.68 and the average donation from a responder is $13.00, a True Positive yields a net profit of 12.32 ($13.00 - $0.68), while a False Positive incurs a loss of $0.68. The challenge lies in finding an optimal classification threshold that balances identifying as many true donors as possible (maximizing TP) while minimizing mailings to non-donors (minimizing FP). Standard classification metrics like accuracy are insufficient, as they do not directly reflect this financial objective.  
+
+### Evaluate the Fit
+Models were evaluated on the validation set using profit, accuracy, ROC-AUC, and confusion matrices. A range of thresholds (0.35 to 0.9) was tested to optimize profit.  
+```{r}
+# Function to evaluate models on validation set
+evaluate_model <- function(model, valid_data, threshold, model_name) {
+  if (inherits(model, "train")) {
+    probs <- predict(model, newdata = valid_data, type = "prob")[, "Donor"]
+  } else {
+    probs <- predict(model, newdata = valid_data, type = "response")
+  }
+  predicted <- ifelse(probs > threshold, "Donor", "No.Donor")
+  cm <- confusionMatrix(factor(predicted, levels = c("No.Donor", "Donor")), valid_data$target)
+  roc_obj <- roc(as.numeric(valid_data$target == "Donor"), probs)
+  profit <- calculate_profit(probs, valid_data$target, threshold)
+  list(
+    model_name = model_name,
+    profit = profit,
+    accuracy = cm$overall["Accuracy"],
+    roc_auc = auc(roc_obj),
+    confusion_matrix = cm$table,
+    probs = probs 
+  )
+}
+
+# Calculate profit for a range of thresholds and evaluate models
+thresholds <- seq(0.35, 0.9, by = 0.01)
+results <- lapply(names(models), function(model_name) {
+  model <- models[[model_name]]
+  if (inherits(model, "train")) {
+    probs <- predict(model, newdata = valid_data_scaled, type = "prob")[, "Donor"]
+  } else {
+    probs <- predict(model, newdata = valid_data_scaled, type = "response")
+  }
+  profits <- sapply(thresholds, calculate_profit, actual = valid_data_scaled$target, probs = probs)
+  best_threshold <- thresholds[which.max(profits)]
+  max_profit <- max(profits)
+  eval_results <- evaluate_model(model, valid_data_scaled, best_threshold, model_name)
+  eval_results$best_threshold <- best_threshold
+  eval_results$max_profit <- max_profit
+  eval_results$profits <- profits
+  return(eval_results)
+})
+
+# Convert results to a data frame for comparison
+results_df <- do.call(rbind, lapply(results, function(res) {
+  data.frame(
+    Model = res$model_name,
+    Max_Profit = res$max_profit,
+    Best_Threshold = res$best_threshold,
+    Accuracy = res$accuracy,
+    ROC_AUC = res$roc_auc
+  )
+}))
+
+# Print results
+cat("Model Comparison:\n")
+print(results_df[order(-results_df$Max_Profit), ])
+```
+
+### Select Best Model
+Cut-Off Analysis: The optimal classification threshold was determined by maximizing profit across thresholds from 0.35 to 0.9. The profit curves for each model were visualized to identify the threshold yielding the highest expected net profit, balancing true positives and false positives.  
+```{r}
+# Select the best model
+best_model_info <- results_df[which.max(results_df$Max_Profit), ]
+best_model <- models[[best_model_info$Model]]
+best_threshold <- best_model_info$Best_Threshold
+cat("\nBest Model:", best_model_info$Model, 
+    "with Max Profit:", round(best_model_info$Max_Profit, 2), 
+    "at Threshold:", best_threshold, "\n")
+
+# Plot profit curves for all models
+plot(thresholds, results[[1]]$profits, type = "l", col = 1, lwd = 2,
+     ylab = "Expected Net Profit", xlab = "Threshold", main = "Profit Curves by Model",
+     ylim = range(sapply(results, function(x) x$profits)))
+for (i in 2:length(results)) {
+  lines(thresholds, results[[i]]$profits, col = i, lwd = 2)
+}
+abline(h = 0, lty = 2, col = "darkgray")
+legend("bottomleft", legend = names(models), col = 1:length(models), lwd = 2)
+```
+Validation Results:  
+
+The best model GBM achieved a maximum profit of around $3450 at threshold 0.36, with accuracy around 0.51 and ROC-AUC around 0.63. Confusion matrices provide detailed performance insights. The ROC-AUC indicates the model’s ability to discriminate between donors and non-donors, while accuracy reflects overall correct predictions. The profit metric ensures alignment with the business objective.  
+
+## Testing
+### Predict on Future Fundraising Data
+The best model was applied to `future_fundraising.csv`, with consistent preprocessing (factor conversion, scaling). The threshold was not adjusted for the test set’s 5.1% response rate, as the validation set’s optimal threshold was deemed sufficient based on profit optimization.  
+```{r}
+# Predict on test set using the best model
+future_fundraising <- read.csv("future_fundraising.csv")
+factor_cols_test <- c("zipconvert2", "zipconvert3", "zipconvert4", "zipconvert5", "homeowner", "female")
+for (col in factor_cols_test) {
+  if (col %in% names(future_fundraising)) {
+    future_fundraising[[col]] <- as.factor(future_fundraising[[col]])
+    future_fundraising[[col]] <- factor(future_fundraising[[col]], levels = levels(fundraising[[col]]))
+  }
+}
+future_fundraising_prepared <- future_fundraising %>% dplyr::select(all_of(final_predictors))
+future_fundraising_scaled <- predict(preProc, future_fundraising_prepared)
+
+# Generate predictions
+if (inherits(best_model, "train")) {
+  test_probs <- predict(best_model, newdata = future_fundraising_scaled, type = "prob")[, "Donor"]
+} else {
+  test_probs <- predict(best_model, newdata = future_fundraising_scaled, type = "response")
+}
+final_predictions_factor <- factor(ifelse(test_probs >= best_threshold, "Donor", "No Donor"),
+                                  levels = c("No Donor", "Donor"))
+```
+
+### Submission File  
+Predictions were saved in `submission.csv` for leaderboard submission.  
+```{r}
+# Create submission file
+submission_df <- data.frame(value = final_predictions_factor)
+write.csv(submission_df, "submission.csv", row.names = FALSE, quote = FALSE)
+cat("Submission file 'submission.csv' created successfully.\n")
+```
+### Recommendations
+Based on the analysis, the following recommendations are proposed:  
+
+- Mailing Strategy: Target mailings to individuals with predicted donor probabilities above 0.36, as this threshold maximizes expected net profit ($3,449.52 for the GBM model). Approximately 20% of the test set was classified as donors, indicating a selective mailing approach that minimizes losses compared to a blanket mailing strategy, which yields a net loss of $0.017 per mailing. This targeted strategy leverages the GBM model’s ability to identify high-probability donors, optimizing campaign profitability.  
+- Model Deployment: Deploy the GBM model for future fundraising campaigns due to its superior performance, achieving a maximum profit of $3,449.52, accuracy of 51%, and ROC-AUC of 0.63. To ensure sustained performance, retrain the model periodically with new donor data to adapt to changing patterns and maintain predictive accuracy.  
+- Feature Engineering: Explore additional derived features, such as `gift_per_prom` (`lifetime_gifts` / `num_prom`), to enhance predictive power in future iterations.  
+- Threshold Adjustment: For datasets reflecting the population’s 5.1% response rate, consider scaling the threshold (e.g., 0.36 × $1 / 0.051 \approx 19.6$) to account for class imbalance. This adjustment may further optimize profit by reducing false positives in unbalanced populations, ensuring cost-effective mailing decisions. 
+- Monitoring and Validation: Establish continuous monitoring in production using profit metrics, confusion matrices, and ROC-AUC to detect data drift or performance degradation. The GBM model’s ROC-AUC of 0.63 indicates moderate discriminative ability, while the accuracy of 51% suggests room for improvement. Regularly review confusion matrices to identify biases (e.g., low sensitivity or specificity) and refine the model as needed.  
+
+## Summary
+This project developed a predictive model to maximize expected net profit for a direct-mail fundraising campaign, addressing a 5.1% response rate, $13.00 average donation, and $0.68 mailing cost. The business objective was to identify high-probability donors to optimize resource allocation, with specific goals of achieving positive profit and accuracy above 50%. The data sources included `fundraising.csv` (3,000 balanced records) and `future_fundraising.csv`, with weighted sampling used to balance classes and improve model learning. EDA involved descriptive statistics, visualizations, chi-square tests, and correlation VIF analyses to select predictors (`num_child`, `income`, `wealth`, `home_value`, `num_prom`, `months_since_donate`, `avg_gift`, `lifetime_gifts`, `largest_gift`, `last_gift`). Exclusions (`avg_fam_inc`, `pct_lt15k`, `med_fam_inc`, `zipconvert2-5`) reduced multicollinearity. Variable transformations included factor conversion for categorical variables and standardization for numerical predictors. Business inputs comprised data, financial parameters, and computational resources. The methodology used five classification models (logistic regression, random forest, XGBoost, SVM, GBM) with 5-fold cross-validation and a custom profit metric, chosen for their complementary strengths and profit alignment. Model performance showed the best model GBM achieved a maximum profit of around $3450 at threshold 0.36, with accuracy around 0.51 and ROC-AUC around 0.63. Cut-off analysis optimized the threshold to balance true and false positives. Recommendations include targeting mailings to high-probability donors and exploring further feature engineering. The final predictions in `submission.csv` are expected to improve leaderboard performance, providing an auditable, reproducible framework for future campaigns.  
